@@ -292,6 +292,33 @@ class Exp(BaseExp):
 
         return val_loader
 
+    def get_cal_loader(self, batch_size, is_distributed, testdev=False, legacy=False, cal_img_list=None):
+        from yolox.data import COCOCalDataset, ValTransform
+
+        valdataset = COCOCalDataset(
+            data_dir=self.data_dir,
+            name="train2017",
+            img_size=self.test_size,
+            preproc=ValTransform(legacy=legacy),
+            cal_img_list=cal_img_list
+        )
+
+        if is_distributed:
+            batch_size = batch_size // dist.get_world_size()
+            sampler = torch.utils.data.distributed.DistributedSampler(valdataset, shuffle=False)
+        else:
+            sampler = torch.utils.data.SequentialSampler(valdataset)
+
+        dataloader_kwargs = {
+            "num_workers": self.data_num_workers,
+            "pin_memory": True,
+            "sampler": sampler,
+        }
+        dataloader_kwargs["batch_size"] = batch_size
+        val_loader = torch.utils.data.DataLoader(valdataset, **dataloader_kwargs)
+
+        return val_loader
+
     def get_evaluator(self, batch_size, is_distributed, testdev=False, legacy=False):
         from yolox.evaluators import COCOEvaluator
 
