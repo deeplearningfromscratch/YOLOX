@@ -19,7 +19,7 @@ from yolox.utils import (
     time_synchronized,
     xyxy2xywh,
 )
-
+import furiosa
 import contextlib
 import io
 import itertools
@@ -358,6 +358,91 @@ class COCOONNXEvaluator(COCOEvaluator):
                     nms_time += nms_end - infer_end
 
             data_list.extend(self.convert_to_coco_format(outputs, info_imgs, ids))
+
+        statistics = torch.FloatTensor([inference_time, nms_time, n_samples])
+        if distributed:
+            data_list = gather(data_list, dst=0)
+            data_list = list(itertools.chain(*data_list))
+            torch.distributed.reduce(statistics, dst=0)
+
+        eval_results = self.evaluate_prediction(data_list, statistics)
+        synchronize()
+        return eval_results
+
+class COCONPUEvaluator(COCOEvaluator):
+    def evaluate(
+        self,
+        model,
+        onnx_model,
+        distributed=False,
+        half=False,
+        trt_file=None,
+        decoder=None,
+        test_size=None,
+    ):
+        """
+        COCO average precision (AP) Evaluation. Iterate inference on the test dataset
+        and the results are evaluated by COCO API.
+
+        NOTE: This function will change training mode to False, please save states if needed.
+
+        Args:
+            model : model to evaluate.
+
+        Returns:
+            ap50_95 (float) : COCO AP of IoU=50:95
+            ap50 (float) : COCO AP of IoU=50
+            summary (sr): summary info of evaluation.
+        """
+        tensor_type = torch.FloatTensor
+        if half:
+            model = model.half()
+        ids = []
+        data_list = []
+        progress_bar = tqdm if is_main_process() else iter
+
+        inference_time = 0
+        nms_time = 0
+        n_samples = max(len(self.dataloader) - 1, 1)
+        if onnx_model.endswith(".dfg"):
+            with open(onnx_model, "rb") as f:
+                graph = f.read()
+        if onnx_model.endswith(".onnx"):
+            graph = onnx_model
+
+        total_predictions = 0
+        elapsed_time = 0
+        from furiosa.runtime import session
+        with session.create(graph) as session:
+            for cur_iter, (imgs, _, info_imgs, ids) in enumerate(progress_bar(self.dataloader)):
+                with torch.no_grad():
+                    imgs = imgs.type(tensor_type)
+                    # this calculates model.head.hw
+                    if cur_iter == 0:
+                        model(imgs)
+
+                    # skip the last iters since batchsize might be not enough for batch inference
+                    is_time_record = cur_iter < len(self.dataloader) - 1
+                    if is_time_record:
+                        start = time.time()
+                    start = time.perf_counter_ns()
+                    output = session.run([imgs.numpy()]).numpy()
+                    elapsed_time += time.perf_counter_ns() - start
+                    outputs = output[0]
+                    outputs = torch.from_numpy(outputs)
+                    if decoder is not None:
+                        outputs = decoder(outputs, dtype=outputs.type())
+
+                    if is_time_record:
+                        infer_end = time_synchronized()
+                        inference_time += infer_end - start
+
+                    outputs = postprocess(outputs, self.num_classes, self.confthre, self.nmsthre)
+                    if is_time_record:
+                        nms_end = time_synchronized()
+                        nms_time += nms_end - infer_end
+                    total_predictions += 1
+                data_list.extend(self.convert_to_coco_format(outputs, info_imgs, ids))
 
         statistics = torch.FloatTensor([inference_time, nms_time, n_samples])
         if distributed:

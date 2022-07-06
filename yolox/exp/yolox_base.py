@@ -347,6 +347,20 @@ class Exp(BaseExp):
         )
         return evaluator
 
+    def get_npu_evaluator(self, batch_size, is_distributed, testdev=False, legacy=False):
+        from yolox.evaluators import COCONPUEvaluator
+
+        val_loader = self.get_eval_loader(batch_size, is_distributed, testdev, legacy)
+        evaluator = COCONPUEvaluator(
+            dataloader=val_loader,
+            img_size=self.test_size,
+            confthre=self.test_conf,
+            nmsthre=self.nmsthre,
+            num_classes=self.num_classes,
+            testdev=testdev,
+        )
+        return evaluator
+
     def get_trainer(self, args):
         from yolox.core import Trainer
 
