@@ -2,19 +2,12 @@
 # -*- coding:utf-8 -*-
 # Copyright (c) Megvii, Inc. and its affiliates.
 
-import contextlib
-import io
-import itertools
-import json
-import tempfile
-import time
-from collections import ChainMap, defaultdict
 from loguru import logger
-from tabulate import tabulate
 from tqdm import tqdm
 
 import numpy as np
 
+import onnxruntime as ort
 import torch
 
 from yolox.data.datasets import COCO_CLASSES
@@ -24,8 +17,16 @@ from yolox.utils import (
     postprocess,
     synchronize,
     time_synchronized,
-    xyxy2xywh
+    xyxy2xywh,
 )
+
+import contextlib
+import io
+import itertools
+import json
+import tempfile
+import time
+from tabulate import tabulate
 
 
 def per_class_AR_table(coco_eval, class_names=COCO_CLASSES, headers=["class", "AR"], colums=6):
@@ -46,7 +47,11 @@ def per_class_AR_table(coco_eval, class_names=COCO_CLASSES, headers=["class", "A
     row_pair = itertools.zip_longest(*[result_pair[i::num_cols] for i in range(num_cols)])
     table_headers = headers * (num_cols // len(headers))
     table = tabulate(
-        row_pair, tablefmt="pipe", floatfmt=".3f", headers=table_headers, numalign="left",
+        row_pair,
+        tablefmt="pipe",
+        floatfmt=".3f",
+        headers=table_headers,
+        numalign="left",
     )
     return table
 
@@ -71,7 +76,11 @@ def per_class_AP_table(coco_eval, class_names=COCO_CLASSES, headers=["class", "A
     row_pair = itertools.zip_longest(*[result_pair[i::num_cols] for i in range(num_cols)])
     table_headers = headers * (num_cols // len(headers))
     table = tabulate(
-        row_pair, tablefmt="pipe", floatfmt=".3f", headers=table_headers, numalign="left",
+        row_pair,
+        tablefmt="pipe",
+        floatfmt=".3f",
+        headers=table_headers,
+        numalign="left",
     )
     return table
 
@@ -114,8 +123,13 @@ class COCOEvaluator:
         self.per_class_AR = per_class_AR
 
     def evaluate(
-        self, model, distributed=False, half=False, trt_file=None,
-        decoder=None, test_size=None, return_outputs=False
+        self,
+        model,
+        distributed=False,
+        half=False,
+        trt_file=None,
+        decoder=None,
+        test_size=None,
     ):
         """
         COCO average precision (AP) Evaluation. Iterate inference on the test dataset
@@ -138,7 +152,6 @@ class COCOEvaluator:
             model = model.half()
         ids = []
         data_list = []
-        output_data = defaultdict()
         progress_bar = tqdm if is_main_process() else iter
 
         inference_time = 0
@@ -155,17 +168,14 @@ class COCOEvaluator:
             model(x)
             model = model_trt
 
-        for cur_iter, (imgs, _, info_imgs, ids) in enumerate(
-            progress_bar(self.dataloader)
-        ):
+        for cur_iter, (imgs, _, info_imgs, ids) in enumerate(progress_bar(self.dataloader)):
             with torch.no_grad():
                 imgs = imgs.type(tensor_type)
-
+                np.save("img.npy", imgs.detach().cpu().numpy())
                 # skip the last iters since batchsize might be not enough for batch inference
                 is_time_record = cur_iter < len(self.dataloader) - 1
                 if is_time_record:
                     start = time.time()
-
                 outputs = model(imgs)
                 if decoder is not None:
                     outputs = decoder(outputs, dtype=outputs.type())
@@ -174,39 +184,26 @@ class COCOEvaluator:
                     infer_end = time_synchronized()
                     inference_time += infer_end - start
 
-                outputs = postprocess(
-                    outputs, self.num_classes, self.confthre, self.nmsthre
-                )
+                outputs = postprocess(outputs, self.num_classes, self.confthre, self.nmsthre)
                 if is_time_record:
                     nms_end = time_synchronized()
                     nms_time += nms_end - infer_end
 
-            data_list_elem, image_wise_data = self.convert_to_coco_format(
-                outputs, info_imgs, ids, return_outputs=True)
-            data_list.extend(data_list_elem)
-            output_data.update(image_wise_data)
+            data_list.extend(self.convert_to_coco_format(outputs, info_imgs, ids))
 
         statistics = torch.cuda.FloatTensor([inference_time, nms_time, n_samples])
         if distributed:
             data_list = gather(data_list, dst=0)
-            output_data = gather(output_data, dst=0)
             data_list = list(itertools.chain(*data_list))
-            output_data = dict(ChainMap(*output_data))
             torch.distributed.reduce(statistics, dst=0)
 
         eval_results = self.evaluate_prediction(data_list, statistics)
         synchronize()
-
-        if return_outputs:
-            return eval_results, output_data
         return eval_results
 
-    def convert_to_coco_format(self, outputs, info_imgs, ids, return_outputs=False):
+    def convert_to_coco_format(self, outputs, info_imgs, ids):
         data_list = []
-        image_wise_data = defaultdict(dict)
-        for (output, img_h, img_w, img_id) in zip(
-            outputs, info_imgs[0], info_imgs[1], ids
-        ):
+        for (output, img_h, img_w, img_id) in zip(outputs, info_imgs[0], info_imgs[1], ids):
             if output is None:
                 continue
             output = output.cpu()
@@ -214,26 +211,12 @@ class COCOEvaluator:
             bboxes = output[:, 0:4]
 
             # preprocessing: resize
-            scale = min(
-                self.img_size[0] / float(img_h), self.img_size[1] / float(img_w)
-            )
+            scale = min(self.img_size[0] / float(img_h), self.img_size[1] / float(img_w))
             bboxes /= scale
-            cls = output[:, 6]
-            scores = output[:, 4] * output[:, 5]
-
-            image_wise_data.update({
-                int(img_id): {
-                    "bboxes": [box.numpy().tolist() for box in bboxes],
-                    "scores": [score.numpy().item() for score in scores],
-                    "categories": [
-                        self.dataloader.dataset.class_ids[int(cls[ind])]
-                        for ind in range(bboxes.shape[0])
-                    ],
-                }
-            })
-
             bboxes = xyxy2xywh(bboxes)
 
+            cls = output[:, 6]
+            scores = output[:, 4] * output[:, 5]
             for ind in range(bboxes.shape[0]):
                 label = self.dataloader.dataset.class_ids[int(cls[ind])]
                 pred_data = {
@@ -244,9 +227,6 @@ class COCOEvaluator:
                     "segmentation": [],
                 }  # COCO json format
                 data_list.append(pred_data)
-
-        if return_outputs:
-            return data_list, image_wise_data
         return data_list
 
     def evaluate_prediction(self, data_dict, statistics):
@@ -302,7 +282,7 @@ class COCOEvaluator:
                 cocoEval.summarize()
             info += redirect_string.getvalue()
             cat_ids = list(cocoGt.cats.keys())
-            cat_names = [cocoGt.cats[catId]['name'] for catId in sorted(cat_ids)]
+            cat_names = [cocoGt.cats[catId]["name"] for catId in sorted(cat_ids)]
             if self.per_class_AP:
                 AP_table = per_class_AP_table(cocoEval, class_names=cat_names)
                 info += "per class AP:\n" + AP_table + "\n"
@@ -312,3 +292,79 @@ class COCOEvaluator:
             return cocoEval.stats[0], cocoEval.stats[1], info
         else:
             return 0, 0, info
+
+
+class COCOONNXEvaluator(COCOEvaluator):
+    def evaluate(
+        self,
+        model,
+        onnx_model,
+        distributed=False,
+        half=False,
+        trt_file=None,
+        decoder=None,
+        test_size=None,
+    ):
+        """
+        COCO average precision (AP) Evaluation. Iterate inference on the test dataset
+        and the results are evaluated by COCO API.
+
+        NOTE: This function will change training mode to False, please save states if needed.
+
+        Args:
+            model : model to evaluate.
+
+        Returns:
+            ap50_95 (float) : COCO AP of IoU=50:95
+            ap50 (float) : COCO AP of IoU=50
+            summary (sr): summary info of evaluation.
+        """
+        tensor_type = torch.FloatTensor
+        if half:
+            model = model.half()
+        ids = []
+        data_list = []
+        progress_bar = tqdm if is_main_process() else iter
+
+        inference_time = 0
+        nms_time = 0
+        n_samples = max(len(self.dataloader) - 1, 1)
+
+        sess = ort.InferenceSession(onnx_model.SerializeToString())
+        input_name = sess.get_inputs()[0].name
+        for cur_iter, (imgs, _, info_imgs, ids) in enumerate(progress_bar(self.dataloader)):
+            with torch.no_grad():
+                imgs = imgs.type(tensor_type)
+                # this calculates model.head.hw
+                if cur_iter == 0:
+                    model(imgs)
+
+                # skip the last iters since batchsize might be not enough for batch inference
+                is_time_record = cur_iter < len(self.dataloader) - 1
+                if is_time_record:
+                    start = time.time()
+                outputs = sess.run([], {input_name: imgs.numpy()})[0]
+                outputs = torch.from_numpy(outputs)
+                if decoder is not None:
+                    outputs = decoder(outputs, dtype=outputs.type())
+
+                if is_time_record:
+                    infer_end = time_synchronized()
+                    inference_time += infer_end - start
+
+                outputs = postprocess(outputs, self.num_classes, self.confthre, self.nmsthre)
+                if is_time_record:
+                    nms_end = time_synchronized()
+                    nms_time += nms_end - infer_end
+
+            data_list.extend(self.convert_to_coco_format(outputs, info_imgs, ids))
+
+        statistics = torch.FloatTensor([inference_time, nms_time, n_samples])
+        if distributed:
+            data_list = gather(data_list, dst=0)
+            data_list = list(itertools.chain(*data_list))
+            torch.distributed.reduce(statistics, dst=0)
+
+        eval_results = self.evaluate_prediction(data_list, statistics)
+        synchronize()
+        return eval_results
