@@ -1,3 +1,77 @@
+# Commands(for internal testing)
+## Install pip packages
+```
+pip install torch tensorboard
+pip install -v -e .
+pip install gdown pydantic furiosa-sdk[quantizer] furiosa-quantizer-experimental
+```
+## Prepare Datasets
+- download coco val2017 dataset and annotations
+```
+mkdir -p datasets/COCO
+gdown 1YN3u3ilMymGZrjrooleweR9-C7Vklkih -O datasets/COCO/mscoco_val2017.tar.gz
+tar -xvf datasets/COCO/mscoco_val2017.tar.gz -C datasets/COCO
+gdown 1kNn-PSpZm8MFfYX23qNlRo1H0jae45cu -O datasets/COCO/annotation.tar.gz
+tar -xvf datasets/COCO/annotation.tar.gz -C datasets/COCO
+```
+- download coco calibration dataset
+```
+gdown 19Ce4M1JuygzihZk3lmFROXtABbgQ4GPb
+tar -xvf mscoco_calibration.tar.gz
+```
+## Run evaluation
+### pytorch model
+- download pytorch weight
+```
+wget https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_l.pth
+```
+- gpu
+```
+python -m yolox.tools.eval -n  yolox-l -c yolox_l.pth -b 32 -d 1 --conf 0.001 --fuse
+```
+- cpu
+not available
+
+### onnx model
+- export onnx model
+```
+python -m tools.export_onnx --output-name yolox_l.onnx -n yolox-l -c yolox_l.pth
+```
+```
+python -m yolox.tools.eval_onnx -n  yolox-l -d 0 -b 1 --conf 0.001 --onnx-input yolox_l.onnx
+```
+### quantized onnx model using python quantizer
+- quantized onnx model
+```
+python -m yolox.tools.quantize_onnx -n  yolox-l -d 0 -b 1 --conf 0.001 --onnx-input yolox_l.onnx
+```
+- eval fake-quantzed onnx model
+```
+python -m yolox.tools.quantize_onnx -n  yolox-l -d 0 -b 1 --conf 0.001 --onnx-input yolox_l_fake_quant.onnx
+``` 
+- eval i8 onnx model
+```
+python -m yolox.tools.eval_onnx_npu -n  yolox-l -d 0 -b 1 --conf 0.001 --onnx-input yolox_l_quant.onnx
+```
+### quantized onnx model using rust quantizer
+- quantize onnx model
+```
+python -m yolox.tools.quantize_onnx_npu -n yolox-l -d 0 -b 1 --conf 0.001 --onnx-input yolox_l.onnx
+```
+- eval i8 onnx model
+```
+python -m yolox.tools.eval_onnx_npu -n  yolox-l -d 0 -b 1 --conf 0.001 --onnx-input yolox_l_quant.dfg
+```
+## YOLOX-l Evaluation results(COCO val2017)
+|Model |mAP<br>0.5:0.95 | 
+| ------        |:---:       
+|Pytorch(on gpu)    |0.497|
+|ONNX(on gpu)    |0.497|
+|fake quant ONNX (python quantizer)   |0.478|
+|i8 ONNX (python quantizer)   |0.477|
+|i8 ONNX (rust quantizer)   |0.478|
+
+
 <div align="center"><img src="assets/logo.png" width="350"></div>
 <img src="assets/demo.png" >
 
